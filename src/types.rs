@@ -144,3 +144,27 @@ impl SharePrice {
         }
     }
 }
+
+#[derive(TypeInfo, Debug, Encode, Decode, Clone, PartialEq, Eq, Default)]
+pub struct StorageFundRedeemPrice((Balance, Balance));
+
+impl StorageFundRedeemPrice {
+    pub(crate) fn new(total_balance: Balance, total_deposit: Balance) -> Self {
+        StorageFundRedeemPrice((total_balance, total_deposit))
+    }
+
+    /// Return the amount of balance can be redeemed by the given `deposit`, it is calculated
+    /// by `storage_fund_total_balance * deposit / total_deposit`.
+    ///
+    /// If the inflow of the storage fund (i.e. refund of the storage fee) is larger than its
+    /// outflow (i.e. payment of the storage fee), the return value will larger than `deposit`
+    /// otherwise smaller.
+    pub(crate) fn redeem(&self, deposit: Balance) -> Balance {
+        let (total_balance, total_deposit) = self.0;
+        if total_balance == total_deposit {
+            deposit
+        } else {
+            Perbill::from_rational(deposit, total_deposit).mul_floor(total_balance)
+        }
+    }
+}

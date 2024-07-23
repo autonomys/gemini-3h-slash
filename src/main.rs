@@ -2,16 +2,17 @@ mod types;
 
 use crate::types::{
     Deposit, DomainEpoch, NominatorStorage, Operator, OperatorNominators, PendingDeposit,
-    SharePrice, Withdrawal, WithdrawalInBalance, WithdrawalInShares,
+    SharePrice, StorageFundRedeemPrice, Withdrawal, WithdrawalInBalance, WithdrawalInShares,
 };
-use codec::Decode;
+use codec::{Decode, Encode};
 use futures::future::join_all;
 use sp_domains::OperatorId;
 use sp_runtime::traits::Zero;
 use std::collections::BTreeMap;
 use substrate_api_client::ac_primitives::{AssetRuntimeConfig, Config};
 use substrate_api_client::rpc::JsonrpseeClient;
-use substrate_api_client::{Api as SApi, GetChainInfo, GetStorage};
+use substrate_api_client::runtime_api::RuntimeApi;
+use substrate_api_client::{Api as SApi, GetAccountInformation, GetChainInfo, GetStorage};
 
 type Balance = <AssetRuntimeConfig as Config>::Balance;
 type Number = <AssetRuntimeConfig as Config>::BlockNumber;
@@ -58,12 +59,23 @@ async fn main() {
         .collect();
 
     let nominator_slashed_balances = join_all(futs).await;
-    for (operator_id, balances) in nominator_slashed_balances {
-        println!("Operator: {:?}", operator_id);
-        for (nominator_id, balance) in balances {
-            println!("\t Nominator[{:?}]: {:?}", nominator_id, balance)
-        }
-    }
+    let total_balance_slashed =
+        nominator_slashed_balances
+            .iter()
+            .fold(Balance::zero(), |acc, (_, nominator_balances)| {
+                acc.checked_add(
+                    nominator_balances
+                        .iter()
+                        .fold(Balance::zero(), |acc, (_, balance)| {
+                            acc.checked_add(*balance).unwrap()
+                        }),
+                )
+                .unwrap()
+            });
+    let treasury_balance = get_treasury_balance(&api).await;
+    println!("Treasury Balance: {:?}", treasury_balance);
+    println!("Total Slashed: {:?}", total_balance_slashed);
+    assert!(treasury_balance >= total_balance_slashed);
 }
 
 async fn get_slashed_operators(api: &Api) -> Vec<(OperatorId, Hash)> {
@@ -223,7 +235,7 @@ async fn calculate_nominators_slashed_amount(
     mut operator: Operator,
     operator_nominators: BTreeMap<AccountId, NominatorStorage>,
     block_hash: Hash,
-) -> (OperatorId, Vec<(AccountId, Balance)>) {
+) -> (OperatorId, BTreeMap<AccountId, Balance>) {
     let mut total_stake = operator
         .current_total_stake
         .checked_add(operator.current_epoch_rewards)
@@ -233,9 +245,12 @@ async fn calculate_nominators_slashed_amount(
     let mut total_shares = operator.current_total_shares;
     let share_price = SharePrice::new(total_shares, total_stake);
 
+    let operator_storage_fund_balance =
+        get_operator_storage_fund_balance(api, operator_id, block_hash).await;
     let mut total_storage_fee_deposit = operator.total_storage_fee_deposit;
 
-    let mut nominators_slashed_balances = vec![];
+    let mut nominators_slashed_balances = BTreeMap::new();
+    let mut nominator_storage_fund_deposited_balances = vec![];
     for (nominator_id, mut nominator_storage) in operator_nominators {
         do_convert_previous_epoch_deposits(
             api,
@@ -245,22 +260,39 @@ async fn calculate_nominators_slashed_amount(
         )
         .await;
 
-        let (amount_ready_to_withdraw, shares_withdrew_in_current_epoch) = match nominator_storage
-            .withdrawal
-        {
-            None => (Zero::zero(), Zero::zero()),
-            Some(mut withdrawal) => {
-                do_convert_previous_epoch_withdrawal(api, operator_id, &mut withdrawal, block_hash)
+        let (amount_ready_to_withdraw, shares_withdrew_in_current_epoch, storage_fund_withdrew) =
+            match nominator_storage.withdrawal {
+                None => (Zero::zero(), Zero::zero(), Zero::zero()),
+                Some(mut withdrawal) => {
+                    do_convert_previous_epoch_withdrawal(
+                        api,
+                        operator_id,
+                        &mut withdrawal,
+                        block_hash,
+                    )
                     .await;
-                (
-                    withdrawal.total_withdrawal_amount,
-                    withdrawal
-                        .withdrawal_in_shares
-                        .map(|WithdrawalInShares { shares, .. }| shares)
-                        .unwrap_or_default(),
-                )
-            }
-        };
+                    (
+                        withdrawal.total_withdrawal_amount,
+                        withdrawal
+                            .withdrawal_in_shares
+                            .map(|WithdrawalInShares { shares, .. }| shares)
+                            .unwrap_or_default(),
+                        withdrawal.withdrawals.into_iter().fold(
+                            Balance::zero(),
+                            |acc, withdrawal_in_balance| {
+                                acc.checked_add(withdrawal_in_balance.storage_fee_refund)
+                                    .unwrap()
+                            },
+                        ),
+                    )
+                }
+            };
+
+        // deduct any unstaked pending storage fee deposits from the total storage deposits.
+        if let Some(pending_deposit) = nominator_storage.deposit.pending {
+            total_storage_fee_deposit =
+                total_storage_fee_deposit.saturating_sub(pending_deposit.storage_fee_deposit);
+        }
 
         let nominator_shares = nominator_storage
             .deposit
@@ -273,8 +305,35 @@ async fn calculate_nominators_slashed_amount(
         total_stake = total_stake.saturating_sub(nominator_staked_amount);
         total_shares = total_shares.saturating_sub(nominator_shares);
 
-        nominators_slashed_balances.push((nominator_id, nominator_staked_amount))
+        // current staked amount + amount ready to withdraw + withdrawn storage fund
+        let total_slashed =
+            nominator_staked_amount + amount_ready_to_withdraw + storage_fund_withdrew;
+        nominators_slashed_balances.insert(nominator_id.clone(), total_slashed);
+
+        // add remaining storage fund balance that is still in the pool for each nominator
+        nominator_storage_fund_deposited_balances.push((
+            nominator_id,
+            nominator_storage.deposit.known.storage_fee_deposit,
+        ))
     }
+
+    // iterate through each nominator storage fund and calculate the actual storage fund based on
+    // total storage fund balance.
+    nominator_storage_fund_deposited_balances
+        .into_iter()
+        .for_each(|(nominator_id, deposited_balance)| {
+            let storage_fund_share_price = StorageFundRedeemPrice::new(
+                operator_storage_fund_balance,
+                total_storage_fee_deposit,
+            );
+            let storage_fund_slashed = storage_fund_share_price.redeem(deposited_balance);
+            let existing_balance = nominators_slashed_balances
+                .get(&nominator_id)
+                .cloned()
+                .unwrap();
+            nominators_slashed_balances
+                .insert(nominator_id, existing_balance + storage_fund_slashed);
+        });
 
     (operator_id, nominators_slashed_balances)
 }
@@ -366,4 +425,33 @@ async fn get_operator_epoch_share_price(
     .await
     .ok()
     .flatten()
+}
+
+async fn get_operator_storage_fund_balance(
+    api: &Api,
+    operator_id: OperatorId,
+    block_hash: Hash,
+) -> Balance {
+    let runtime_api = api.runtime_api();
+    runtime_api
+        .runtime_call::<Balance>(
+            "DomainsApi_storage_fund_account_balance",
+            vec![operator_id.encode()],
+            Some(block_hash),
+        )
+        .await
+        .unwrap()
+}
+
+async fn get_treasury_balance(api: &Api) -> Balance {
+    let treasury_account = api
+        .get_constant::<AccountId>("Domains", "TreasuryAccount")
+        .await
+        .unwrap();
+    api.get_account_data(&treasury_account)
+        .await
+        .ok()
+        .flatten()
+        .unwrap()
+        .free
 }
