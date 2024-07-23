@@ -15,6 +15,7 @@ sp-runtime = { git = "https://github.com/subspace/polkadot-sdk", rev = "0cbfcb02
 sp-state-machine = { git = "https://github.com/subspace/polkadot-sdk", rev = "0cbfcb0232bbf71ac5b14cc8c99bf043cec420ef" }
 substrate-api-client = { git = "https://github.com/scs/substrate-api-client.git" }
 sp-domains = { git = "https://github.com/subspace/subspace", rev = "abfb71341fdaf246b9112df66de50eec99aa711a" }
+pallet-domains = { git = "https://github.com/subspace/subspace", rev = "abfb71341fdaf246b9112df66de50eec99aa711a" }
 scale-info = { version = "2.11.2", default-features = false, features = ["derive"] }
 tokio = {version = "1.38.1", features = ["rt-multi-thread", "macros", "time"]}
 futures = "0.3.30"
