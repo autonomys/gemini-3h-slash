@@ -1,18 +1,29 @@
+#![deny(unused_crate_dependencies)]
+
 mod types;
 
 use crate::types::{
     Deposit, DomainEpoch, NominatorStorage, Operator, OperatorNominators, PendingDeposit,
     SharePrice, StorageFundRedeemPrice, Withdrawal, WithdrawalInBalance, WithdrawalInShares,
 };
+use clap::Parser;
 use codec::{Decode, Encode};
 use futures::future::join_all;
+use sp_core::crypto::{ExposeSecret, SecretString};
+use sp_core::sr25519::Pair;
+use sp_core::Pair as PairT;
 use sp_domains::OperatorId;
 use sp_runtime::traits::Zero;
 use std::collections::BTreeMap;
-use substrate_api_client::ac_primitives::{AssetRuntimeConfig, Config};
+use substrate_api_client::ac_compose_macros::log::{debug, error, info};
+use substrate_api_client::ac_compose_macros::{compose_call, compose_extrinsic_with_nonce};
+use substrate_api_client::ac_primitives::{AssetRuntimeConfig, Config, ExtrinsicSigner};
+use substrate_api_client::extrinsic::utility::Batch;
 use substrate_api_client::rpc::JsonrpseeClient;
 use substrate_api_client::runtime_api::RuntimeApi;
-use substrate_api_client::{Api as SApi, GetAccountInformation, GetChainInfo, GetStorage};
+use substrate_api_client::{
+    Api as SApi, GetAccountInformation, GetChainInfo, GetStorage, SubmitAndWatch, XtStatus,
+};
 
 type Balance = <AssetRuntimeConfig as Config>::Balance;
 type Number = <AssetRuntimeConfig as Config>::BlockNumber;
@@ -20,12 +31,28 @@ type Hash = <AssetRuntimeConfig as Config>::Hash;
 type AccountId = <AssetRuntimeConfig as Config>::AccountId;
 type Api = SApi<AssetRuntimeConfig, JsonrpseeClient>;
 
+#[derive(Debug, Parser)]
+pub struct Args {
+    /// Sudo key
+    ///
+    /// Example: "//Alice".
+    #[arg(long, required = true)]
+    keystore_suri: SecretString,
+}
+
 #[tokio::main]
 async fn main() {
+    let args = Args::parse();
+    let sudoer = Pair::from_string(args.keystore_suri.expose_secret(), None).unwrap();
+    debug!("Sudo public key: {:?}", sudoer.public().to_string());
+
+    let sudoer = ExtrinsicSigner::<AssetRuntimeConfig>::new(sudoer);
     let client = JsonrpseeClient::new("wss://rpc-0.gemini-3h.subspace.network/ws")
         .await
         .unwrap();
-    let api = SApi::<AssetRuntimeConfig, _>::new(client).await.unwrap();
+    let mut api = SApi::<AssetRuntimeConfig, _>::new(client).await.unwrap();
+    api.set_signer(sudoer);
+
     let slashed_operators = get_slashed_operators(&api).await;
     let fut_storages: Vec<_> = slashed_operators
         .clone()
@@ -73,9 +100,24 @@ async fn main() {
                 .unwrap()
             });
     let treasury_balance = get_treasury_balance(&api).await;
-    println!("Treasury Balance: {:?}", treasury_balance);
-    println!("Total Slashed: {:?}", total_balance_slashed);
-    assert!(treasury_balance >= total_balance_slashed);
+    info!("Treasury Balance: {:?}", treasury_balance);
+    info!("Total Slashed: {:?}", total_balance_slashed);
+    assert!(
+        treasury_balance >= total_balance_slashed,
+        "Treasury balance not sufficient for transfer"
+    );
+
+    // get the starting nonce of the sudoer and dispatch batch call for each operator
+    let mut nonce = api.get_nonce().await.unwrap();
+    let futs: Vec<_> = nominator_slashed_balances
+        .into_iter()
+        .map(|(operator_id, nominator_balances)| {
+            let fut = transfer_balance_from_treasury(&api, nonce, operator_id, nominator_balances);
+            nonce += 1;
+            fut
+        })
+        .collect();
+    join_all(futs).await;
 }
 
 async fn get_slashed_operators(api: &Api) -> Vec<(OperatorId, Hash)> {
@@ -92,6 +134,22 @@ async fn get_slashed_operators(api: &Api) -> Vec<(OperatorId, Hash)> {
         (37, 2368542),
         (77, 2368906),
         (40, 2369910),
+        (80, 2374768),
+        (81, 2375003),
+        (21, 2375130),
+        (48, 2375244),
+        (71, 2380396),
+        (56, 2381733),
+        (51, 2383817),
+        (6, 2384081),
+        (73, 2384081),
+        (76, 2384081),
+        (10, 2384081),
+        (24, 2384516),
+        (52, 2386856),
+        (79, 2386991),
+        (45, 2387166),
+        (102, 2388238),
     ];
 
     let futs: Vec<_> = slashed_operators
@@ -132,8 +190,9 @@ async fn get_nominator_deposits_and_withdrawal(
         .into_iter()
         .for_each(|(nominator_id, withdrawal)| {
             match storage.get(&nominator_id) {
-                // there will always be a deposit for this nominator even with zero shares
-                None => return,
+                None => panic!(
+                    "there will always be a deposit for this nominator even with zero shares"
+                ),
                 Some(nominator_storage) => storage.insert(
                     nominator_id,
                     NominatorStorage {
@@ -143,8 +202,7 @@ async fn get_nominator_deposits_and_withdrawal(
                 ),
             };
         });
-    let nominator_count = get_nominator_count(api, operator_id, block_hash).await;
-    assert_eq!(storage.len() as u32, nominator_count);
+
     OperatorNominators {
         operator_id,
         nominator_storage: storage,
@@ -192,18 +250,6 @@ async fn get_nominator_storage<V: Decode>(
         .collect();
 
     join_all(storage_futures).await
-}
-
-async fn get_nominator_count(api: &Api, operator_id: OperatorId, block_hash: Hash) -> u32 {
-    let count = api
-        .get_storage_map::<_, u32>("Domains", "NominatorCount", operator_id, Some(block_hash))
-        .await
-        .ok()
-        .flatten()
-        .unwrap();
-
-    // + 1 since operator's nominator is not counted
-    count + 1
 }
 
 async fn get_operator_info(
@@ -454,4 +500,43 @@ async fn get_treasury_balance(api: &Api) -> Balance {
         .flatten()
         .unwrap()
         .free
+}
+
+async fn transfer_balance_from_treasury(
+    api: &Api,
+    nonce: u32,
+    operator_id: OperatorId,
+    nominator_balances: BTreeMap<AccountId, Balance>,
+) {
+    debug!("Sending batch transfer for Operator[{operator_id:?}] with Nonce[{nonce}] for {:?} Nominators", nominator_balances.len());
+    let metadata = api.metadata();
+    let transfer_calls = nominator_balances
+        .into_iter()
+        .map(|(acc, balance)| {
+            compose_call!(metadata, "Domains", "transfer_treasury_funds", acc, balance).unwrap()
+        })
+        .collect();
+
+    let calls = Batch {
+        calls: transfer_calls,
+    };
+    let batch_call = compose_call!(metadata, "Utility", "batch_all", calls).unwrap();
+    let xt = compose_extrinsic_with_nonce!(&api, nonce, "Sudo", "sudo", batch_call).unwrap();
+    let result = api
+        .submit_and_watch_extrinsic_until(xt, XtStatus::InBlock)
+        .await;
+    match result {
+        Ok(res) => {
+            info!(
+                "Batch extrinsic for Operator[{operator_id:?}] included in block: {:?}",
+                res.block_hash
+            );
+        }
+        Err(err) => {
+            error!(
+                "Failed to submit batch for Operator[{operator_id:?}]: {:?}",
+                err
+            )
+        }
+    };
 }

@@ -4,18 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+clap = { version = "4.5.11", features = ["derive"] }
 codec = { package = "parity-scale-codec", version = "3.6.12", features = ["derive"] }
-sc-client-api = { git = "https://github.com/subspace/polkadot-sdk", rev = "0cbfcb0232bbf71ac5b14cc8c99bf043cec420ef" }
-sp-api = { git = "https://github.com/subspace/polkadot-sdk", rev = "0cbfcb0232bbf71ac5b14cc8c99bf043cec420ef" }
-sp-blockchain = { git = "https://github.com/subspace/polkadot-sdk", rev = "0cbfcb0232bbf71ac5b14cc8c99bf043cec420ef" }
-sp-block-builder = { git = "https://github.com/subspace/polkadot-sdk", rev = "0cbfcb0232bbf71ac5b14cc8c99bf043cec420ef" }
 sp-core = { git = "https://github.com/subspace/polkadot-sdk", rev = "0cbfcb0232bbf71ac5b14cc8c99bf043cec420ef" }
-sp-inherents = { git = "https://github.com/subspace/polkadot-sdk", rev = "0cbfcb0232bbf71ac5b14cc8c99bf043cec420ef" }
 sp-runtime = { git = "https://github.com/subspace/polkadot-sdk", rev = "0cbfcb0232bbf71ac5b14cc8c99bf043cec420ef" }
-sp-state-machine = { git = "https://github.com/subspace/polkadot-sdk", rev = "0cbfcb0232bbf71ac5b14cc8c99bf043cec420ef" }
 substrate-api-client = { git = "https://github.com/scs/substrate-api-client.git" }
 sp-domains = { git = "https://github.com/subspace/subspace", rev = "abfb71341fdaf246b9112df66de50eec99aa711a" }
-pallet-domains = { git = "https://github.com/subspace/subspace", rev = "abfb71341fdaf246b9112df66de50eec99aa711a" }
 scale-info = { version = "2.11.2", default-features = false, features = ["derive"] }
 tokio = {version = "1.38.1", features = ["rt-multi-thread", "macros", "time"]}
 futures = "0.3.30"
+
+[patch."https://github.com/paritytech/polkadot-sdk.git"]
+sp-core = { git = "https://github.com/subspace/polkadot-sdk", rev = "0cbfcb0232bbf71ac5b14cc8c99bf043cec420ef" }
+sp-state-machine = { git = "https://github.com/subspace/polkadot-sdk", rev = "0cbfcb0232bbf71ac5b14cc8c99bf043cec420ef" }
+sp-io = { git = "https://github.com/subspace/polkadot-sdk", rev = "0cbfcb0232bbf71ac5b14cc8c99bf043cec420ef" }

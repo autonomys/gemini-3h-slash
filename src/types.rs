@@ -62,6 +62,7 @@ pub(crate) struct WithdrawalInShares {
     pub(crate) storage_fee_refund: Balance,
 }
 
+#[derive(TypeInfo, Debug, Encode, Decode, Clone, PartialEq, Eq)]
 pub(crate) struct NominatorStorage {
     pub(crate) deposit: Deposit,
     pub(crate) withdrawal: Option<Withdrawal>,
@@ -122,25 +123,25 @@ impl SharePrice {
         SharePrice(if shares.is_zero() || stake.is_zero() {
             Perbill::one()
         } else {
-            Perbill::from_rational(shares, stake.into())
+            Perbill::from_rational(shares, stake)
         })
     }
 
     /// Converts stake to shares based on the share price
     pub(crate) fn stake_to_shares(&self, stake: Balance) -> Balance {
         if self.0.is_one() {
-            stake.into()
+            stake
         } else {
-            self.0.mul_floor(stake).into()
+            self.0.mul_floor(stake)
         }
     }
 
     /// Converts shares to stake based on the share price
     pub(crate) fn shares_to_stake(&self, shares: Balance) -> Balance {
         if self.0.is_one() {
-            shares.into()
+            shares
         } else {
-            self.0.saturating_reciprocal_mul_floor(shares.into())
+            self.0.saturating_reciprocal_mul_floor(shares)
         }
     }
 }
